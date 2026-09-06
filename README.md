@@ -9,6 +9,9 @@
 - **Opera over MASQUE（套娃）** — 在 WARP 外面再叠一层 Opera VPN 落地，
   换个出口国家。见文末[套娃那条](#套娃opera-vpn-叠在-warp-上)。
 
+另外 `worker/` 目录是套娃那条的 Worker 版本，部署到 Cloudflare 上自己每 4 小时
+更新，带个状态页。见[跑在 Worker 上](#跑在-worker-上)。
+
 ## 怎么用
 
 **1. Fork 这个仓库**
@@ -244,3 +247,168 @@ Shadowrocket、Stash 不认 `dialer-proxy`，用不了套娃配置——
 
 `scripts/gen_opera_masque.py`。接入点清单和纯 WARP 那份是同一批
 （`V4` / `V6` / `PORTS`），`REGIONS` 控制取哪些 Opera 大区。
+
+---
+
+## 跑在 Worker 上
+
+Actions 那条要手动点一下才跑。如果想要它自己更新、随时有个 URL 能拿到最新配置，
+用 `worker/` 这份。
+
+不用定时任务。Opera 凭据 4 小时到期，Worker 在订阅被访问时才检查：
+没过期直接给缓存，过期了才重新注册。没人用就不动，不浪费。
+
+WARP 的注册信息存 KV 里复用，不会每次都注册新设备。
+
+密码和订阅路径都在界面上设，所以部署只需要绑一个 KV，
+不用配环境变量，也不用加 cron。
+
+### 部署方式一：网页（不用装任何东西）
+
+全程在 Cloudflare 后台点，四步。
+
+**1. 建 KV**
+
+Cloudflare 后台 → 左边 `存储和数据库` → `KV` → `创建实例`。
+名字随便填，比如 `opera-masque`。
+
+> 找不到入口的话，`Workers 和 Pages` 里也能进 KV。菜单名各语言版本略有差异，
+> 认准 "KV" 这两个字母。
+
+**2. 建 Worker 并贴代码**
+
+左边 `Compute (Workers)` → `创建` → `从 Hello World! 开始` → 起个名 → `部署`。
+
+先部署一个空壳，然后点右上角 `编辑代码`，把
+[`worker/dist/worker.js`](worker/dist/worker.js) 整个文件的内容复制进去，
+覆盖掉原来的 `Hello World`。这是打包好的单文件，全选粘贴就行。
+
+粘完点 `部署`。
+
+**3. 绑 KV**
+
+回到 Worker 页面 → `设置` → `绑定` → `添加` → 选 `KV 命名空间`。
+
+- 变量名填 **`KV`**（必须是这两个字母，大写）
+- KV 命名空间选第 1 步建的那个
+
+点 `部署`。
+
+**4. 打开设密码**
+
+访问 `https://你的worker名.你的子域.workers.dev`，
+第一次打开会让你设管理密码，设完直接进管理页。
+
+订阅地址、改路径、改密码都在这个页面上。
+
+第一次点订阅可能要等十几秒，它在现注册 WARP 和 Opera。
+
+> 没绑 KV 就打开的话，页面会告诉你怎么绑，不会报一堆栈。
+
+### 部署方式二：命令行
+
+```bash
+cd worker
+npm install
+npx wrangler login
+
+# 建 KV，把输出的 id 填进 wrangler.toml
+npx wrangler kv namespace create KV
+
+npx wrangler deploy
+```
+
+部署完访问 `https://你的worker.workers.dev/` 设密码。
+订阅路径也在界面上改，不用动配置文件。
+
+### 改了代码想重新打包
+
+网页部署用的 `dist/worker.js` 是从 `src/` 打包出来的，改完源码跑一下：
+
+```bash
+npm run build
+```
+
+### 访问控制怎么做的
+
+状态页和所有 API 都要密码。客户端拉订阅时带不了 cookie，所以订阅链接里
+挂了个签名 token——状态页上显示的那条完整链接直接复制走就行。
+
+- 密码只存 PBKDF2 哈希 + 随机盐，KV 里看不到明文
+- 会话是 HMAC 签名的 token，cookie 里没有密码本身
+- 密码比对走常数时间，不会从响应时间里泄露
+- 同一 IP 连续失败 8 次锁 15 分钟
+- 订阅路径不对或 token 无效，一律返回 404，不提示"密码错误"这类可枚举信息
+- 想让所有旧链接失效，在界面上改一次密码就够了（token 是用密码哈希签的）
+
+### 路由
+
+| 路径 | 说明 |
+|---|---|
+| `/` | 首次是设密码页，之后是登录/管理页 |
+| `/login` `/logout` | 登录、退出 |
+| 你设的订阅路径 | 订阅，要 `?token=` |
+| `/api/setup` | POST，首次设密码 |
+| `/api/password` | POST，改密码 |
+| `/api/sub-path` | POST，改订阅路径 |
+| `/api/refresh` | POST，重新拿 Opera 凭据 |
+| `/api/reset-warp` | POST，重注册 WARP 设备 |
+
+订阅响应带了 `profile-update-interval: 4`，支持这个头的客户端会自己每 4 小时拉一次，
+正好卡在凭据到期点上。
+
+### 更新是怎么触发的
+
+没有 cron。订阅每次被访问时，Worker 看一眼 `expiresAt`：
+
+- 还没到期 → 直接给缓存，不碰任何 API
+- 到期了 → 重新注册 Opera，重建配置
+
+多个客户端同时拉订阅时会加锁，只有一个真去注册，其他的先用旧配置顶着，
+免得并发注册一堆账号触发风控。
+
+4 小时这个数来自 opera-proxy 自己的 `-refresh 4h` 默认值。
+SurfEasy 的 API 不返回真实过期时间，所以按这个走，另外留了 10 分钟余量。
+
+### Worker 常见问题
+
+**打开显示 KV Not Bound** — 第 3 步没做，或者绑定的变量名不是 `KV`。
+必须是这两个字母大写。
+
+**忘了密码** — 没有找回。去 KV 里把 `auth:cred` 这条删掉，
+刷新页面就回到设密码那步。别的数据不受影响。
+
+**订阅链接打开是 404** — token 过期了（7 天），回状态页重新复制一条。
+改过密码的话所有旧链接都会失效，这是故意的。
+
+**节点全都连不上** — 先点`刷新 Opera 凭据`。还不行再点`重注册 WARP 设备`。
+
+**导入客户端报错说不认识 masque** — 内核不是 mihomo Alpha。见下面那节。
+
+### 跑测试
+
+```bash
+cd worker && npm test
+```
+
+33 项，覆盖常数时间比较、token 伪造/篡改/过期、登录限速，
+以及路由层的鉴权（未登录一律 404、订阅 token 校验、cookie 安全属性）。
+
+### 两个坑
+
+**WebCrypto 导不出 mihomo 要的私钥格式。** WebCrypto 只能导 PKCS8，
+mihomo 要 SEC1，直接喂会报 `use ParsePKCS8PrivateKey instead`。
+而且光把 PKCS8 里那段抠出来还不够——WebCrypto 省略了曲线参数，
+会接着报 `unknown elliptic curve`。`warp.js` 里的 `pkcs8ToSec1`
+重新编了一份带 P-256 OID 的完整 SEC1。
+
+**Opera 的 API 用 Digest 认证，而 Digest 要 MD5。** WebCrypto 没有 MD5，
+所以 `md5.js` 是手写的。另外 Workers 的 fetch 不自动管 cookie，
+SurfEasy 的会话得手工存 `Set-Cookie`。
+
+### 跟 Actions 版的区别
+
+Worker 版少一道 `mihomo -t` 校验——Actions 里会真的下载 mihomo 加载一遍，
+确保推出去的配置能用，Worker 里做不到。
+
+换来的是自动更新和一个随时可用的 URL。
